@@ -1,0 +1,14 @@
+# Render this template with install_service.py; do not copy it unmodified.
+[Unit]
+Description=Retry capacity-failed Codex sessions
+
+[Service]
+Type=simple
+ExecStart=@PYTHON@ @SCRIPT@ --env-file @ENV_FILE@
+StandardOutput=null
+StandardError=null
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

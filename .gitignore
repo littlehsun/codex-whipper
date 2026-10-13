@@ -1,0 +1,26 @@
+# Private configuration (only the sanitized example is public).
+.env*
+!.env.example
+*.env
+
+# Local interpreters and generated Python files.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Runtime data can contain local paths, prompts, and session identifiers.
+logs/
+*.log
+*.log.*
+.state/
+state.json*
+dry-run.json*
+*.sqlite*
+*.db*
+*.sock
+
+# Local editor files.
+.idea/
+.vscode/
+.DS_Store
