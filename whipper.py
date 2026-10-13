@@ -30,6 +30,13 @@ class BoundedLogHandler(RotatingFileHandler):
     """Active file + one backup <= 1 MB, including UTF-8 and large errors."""
     def __init__(self, path):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Bound pre-existing files too, before any new record is emitted.
+        for file in [path, path.with_name(path.name + ".1")]:
+            if file.exists() and file.stat().st_size > LOG_TOTAL_BYTES // 2:
+                with file.open("rb") as old:
+                    old.seek(-LOG_TOTAL_BYTES // 2, os.SEEK_END)
+                    tail = old.read().partition(b"\n")[2]
+                file.write_bytes(tail)  # Discard the partial first record / UTF-8 sequence.
         super().__init__(path, maxBytes=LOG_TOTAL_BYTES // 2, backupCount=1, encoding="utf-8")
 
     def format(self, record):
@@ -52,6 +59,17 @@ class BoundedLogHandler(RotatingFileHandler):
 def cwd_field(event):
     """Quote paths so spaces and line breaks remain one unambiguous log field."""
     return json.dumps(event.get("cwd") or "<unknown>", ensure_ascii=False)
+
+
+def excluded_thread(thread):
+    """Apply root-session scope to both transports."""
+    source = thread.get("source")
+    if thread.get("parentThreadId") or (isinstance(source, dict) and any(
+            k in source for k in ["subAgent", "subagent", "internal"])):
+        return "subagent_or_internal"
+    if thread.get("ephemeral"):
+        return "ephemeral"
+    return None
 
 
 class RpcError(RuntimeError):
@@ -112,7 +130,7 @@ def socket_owner_pids(socket: Path) -> set[int]:
     socket_path = str(socket.resolve())
     inodes = set()
     for line in Path("/proc/net/unix").read_text().splitlines()[1:]:
-        cols = line.split()
+        cols = line.split(maxsplit=7)  # Unix socket paths may contain spaces.
         if len(cols) >= 8 and cols[7] == socket_path and int(cols[3], 16) & 0x10000:
             inodes.add(f"socket:[{cols[6]}]")
     owners = set()
@@ -276,11 +294,19 @@ class HerdrFallback:
         decision = self.identity(env, pane, pid, tid)
         if decision != "ready":
             return decision
+        thread = rpc.call("thread/read", {"threadId": tid, "includeTurns": False})["thread"]
+        reason = excluded_thread(thread)
+        if reason:
+            return reason
+        if isinstance(thread.get("cwd"), str) and thread["cwd"]:
+            event["cwd"] = thread["cwd"]
         turn = self.latest(rpc, tid)
         if not turn or turn["id"] != event["turn_id"]:
             return "newer_turn_or_no_turn"
         if turn.get("status") != "failed" or CAPACITY not in (turn.get("error") or {}).get("message", ""):
             return "latest_turn_not_capacity_failed"
+        if rpc.call("thread/queue/list", {"threadId": tid, "limit": 1})["data"]:
+            return "user_input_queued"
         decision = self.screen(env, pane)
         if decision == "ready":
             self.targets[tid] = env, pane, pid
@@ -288,9 +314,9 @@ class HerdrFallback:
 
     def send(self, event, message, rpc):
         tid = event["thread_id"]
-        env, pane, pid = self.targets[tid]
         if self.inspect(event, rpc) != "ready":
             raise RuntimeError("Herdr session changed before submission")
+        env, pane, _ = self.targets[tid]
         self.run(env, "agent", "prompt", pane, message)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -372,11 +398,9 @@ class Watcher:
         thread = self.rpc.call("thread/read", {"threadId": tid, "includeTurns": False})["thread"]
         if isinstance(thread.get("cwd"), str) and thread["cwd"]:
             event["cwd"] = thread["cwd"]
-        source = thread.get("source")
-        if thread.get("parentThreadId") or (isinstance(source, dict) and any(k in source for k in ["subAgent", "subagent", "internal"])):
-            return "subagent_or_internal"
-        if thread.get("ephemeral"):
-            return "ephemeral"
+        reason = excluded_thread(thread)
+        if reason:
+            return reason
         if thread.get("status", {}).get("type") == "notLoaded":
             return "not_loaded"
         if thread.get("canAcceptDirectInput") is not True:
@@ -409,6 +433,13 @@ class Watcher:
         owners = self.owners(self.args.socket)
         for event in due:
             tid = event["thread_id"]
+            # State survives restarts; current authorization and limits win.
+            if self.args.thread and tid not in self.args.thread:
+                self.discard(tid, "outside_current_scope")
+                continue
+            if event["attempts"] >= self.args.max_retries:
+                self.discard(tid, "retry_limit")
+                continue
             if now - event["ts"] > self.args.max_age:
                 self.discard(tid, "expired")
                 continue

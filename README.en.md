@@ -61,7 +61,7 @@ Precedence: **CLI options > process environment > `.env` > built-in defaults**.
 | `WHIPPER_DATABASE` | Blank derives `logs_2.sqlite` from Codex home. |
 | `WHIPPER_SOCKET` | Blank derives `app-server-control/app-server-control.sock` from Codex home. |
 | `WHIPPER_STATE` | Blank uses `~/.local/state/codex-whipper/state.json`; dry-run gets separate state. |
-| `WHIPPER_THREADS` | Blank monitors eligible shared-server root sessions; UUIDs restrict the scope. |
+| `WHIPPER_THREADS` | Blank monitors eligible shared-server root sessions; UUIDs restrict the scope, including Herdr targets. |
 | `WHIPPER_HERDR_THREADS` | Explicit allowlist for Herdr-controlled standalone CLI sessions. Blank disables the fallback. |
 | `WHIPPER_HERDR_BIN` | Herdr executable; default `~/.local/bin/herdr`, or set `herdr` to use PATH. |
 | `WHIPPER_MESSAGE` | Retry prompt; default `keep doing`. |
@@ -96,7 +96,7 @@ In your own Herdr environment, inspect an explicit pane:
 herdr agent get <pane-id>
 ```
 
-Use the returned `agent.agent_session.value` as the UUID. The watcher obtains the pane/socket from the original process, then checks the foreground PID, Codex session UUID, idle/done state, latest capacity failure, and empty composer. Blocked, unknown, replaced sessions, or pending typed input are not prompted. It does not change focus, restart the CLI, or answer approval dialogs.
+Use the returned `agent.agent_session.value` as the UUID. The watcher obtains the pane/socket from the original process, then checks the foreground PID, Codex session UUID, idle/done state, root-session scope, latest capacity failure, absence of queued input, and empty composer. Blocked, unknown, replaced sessions, or pending typed input are not prompted. It does not change focus, restart the CLI, or answer approval dialogs.
 
 A successful `agent prompt` submission is not sufficient: a new turn ID must be observed before the retry is recorded as accepted. Other standalone app-servers and remote hosts are not automatically controlled through this local fallback.
 
@@ -110,6 +110,8 @@ A successful `agent prompt` submission is not sufficient: a new turn ID must be 
 Default delays are **60, 120, 240, 300, and 300 seconds**, at most five retries. Only a capacity failure of the watcher's own next turn continues the retry count. A new user turn starts a separate chain. Submission does not guarantee capacity is available; another capacity failure returns to this flow.
 
 State stores the cursor, pending events, and retry chains using atomic rename, fsync, and a file lock. Do not run multiple live watchers with different state files against the same session.
+
+After a restart, existing pending events also obey the current thread scope and retry limit. Narrowing scope or lowering the limit does not preserve old permission to submit. Keep any custom state path outside the repository or in an ignored directory.
 
 Dry-run never shares live state. Its default file is `dry-run.json`; explicitly configuring `live.json` selects a sibling `live.dry-run.json` during dry-run. `--once` does not wait for events whose delay has not elapsed: those remain in that state's pending list for a later run.
 
@@ -130,7 +132,7 @@ INFO sent thread=<session-uuid> cwd="/work/project" turn=<new-turn-uuid> attempt
 
 `cwd` comes from session metadata, not the shared daemon's process directory. Missing metadata is shown as `<unknown>` and does not block retries.
 
-The active file and one `.1` backup are each limited to **500,000 bytes**, for a combined **1,000,000-byte (1 MB)** budget. Rotation counts UTF-8 bytes; oversized records are truncated. Logs and state can contain paths, messages, and session IDs, and should not be uploaded or committed.
+The active file and one `.1` backup are each limited to **500,000 bytes**, for a combined **1,000,000-byte (1 MB)** budget. Rotation counts UTF-8 bytes; oversized records are truncated. On startup, oversized existing files are trimmed by removing the oldest records. Logs and state can contain paths, messages, and session IDs, and should not be uploaded or committed.
 
 ## Optional systemd service
 

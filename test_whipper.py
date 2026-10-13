@@ -6,7 +6,6 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
-import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -19,6 +18,20 @@ NOW = 1000
 
 
 class BoundedLogTests(unittest.TestCase):
+    def test_existing_oversized_logs_are_bounded_on_open(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "whipper.log"
+            backup = path.with_name(path.name + ".1")
+            for file in [path, backup]:
+                file.write_text("舊紀錄\n" * 100_000, encoding="utf-8")
+            handler = whipper.BoundedLogHandler(path)
+            try:
+                for file in [path, backup]:
+                    self.assertLessEqual(file.stat().st_size, 500_000)
+                    file.read_text(encoding="utf-8")
+            finally:
+                handler.close()
+
     def test_rotation_bounds_total_bytes_for_unicode_and_huge_errors(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "logs/whipper.log"
@@ -73,6 +86,10 @@ class FakeRpc:
 
 class WatcherTests(unittest.TestCase):
     def setUp(self):
+        self.environment = patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                                  if not k.startswith("WHIPPER_")}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "logs.sqlite"
@@ -83,7 +100,7 @@ class WatcherTests(unittest.TestCase):
         env_file.write_text("# Isolated test configuration\n")
         self.args = whipper.parse_args([
             "--env-file", str(env_file),
-            "--database", str(self.db), "--socket", str(self.root / "server.sock"),
+            "--database", str(self.db), "--socket", str(self.root / "server with spaces.sock"),
             "--state", str(self.root / "state.json"), "--delay", "60",
         ])
         self.store = whipper.LogStore(self.db)
@@ -219,6 +236,57 @@ class WatcherTests(unittest.TestCase):
         self.args.thread = ["another-thread"]
         self.watcher.tick(NOW + 60)
         self.assertEqual(self.rpc.sends, [])
+
+    def test_pending_event_respects_narrowed_scope_after_restart(self):
+        self.add_error()
+        self.watcher.tick(NOW)
+        self.assertIn(TID, self.state.data["pending"])
+        self.state.close()
+        self.state = whipper.State(self.args.state, self.db, self.args.socket, 999)
+        self.watcher.state = self.state
+        self.args.thread = [NEXT]
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.rpc.sends, [])
+        self.assertFalse(self.state.data["pending"])
+
+    def test_pending_retry_respects_lowered_limit(self):
+        self.add_error()
+        self.watcher.tick(NOW + 60)
+        self.add_error(turn=NEXT, ts=NOW + 61)
+        self.rpc.turn["id"] = NEXT
+        self.watcher.tick(NOW + 61)
+        self.assertIn(TID, self.state.data["pending"])
+        self.args.max_retries = 1
+        self.watcher.tick(NOW + 181)
+        self.assertEqual(len(self.rpc.sends), 1)
+        self.assertFalse(self.state.data["pending"])
+
+    def test_herdr_rechecks_thread_scope_and_queued_input(self):
+        fallback = whipper.HerdrFallback([TID], "herdr")
+        event = {"thread_id": TID, "turn_id": TURN}
+        with patch.object(fallback, "target", return_value=({}, "pane", os.getpid())), \
+                patch.object(fallback, "identity", return_value="ready"), \
+                patch.object(fallback, "screen", return_value="ready"):
+            self.rpc.thread["parentThreadId"] = NEXT
+            self.assertEqual(fallback.inspect(event, self.rpc), "subagent_or_internal")
+            self.rpc.thread["parentThreadId"] = None
+            self.rpc.thread["ephemeral"] = True
+            self.assertEqual(fallback.inspect(event, self.rpc), "ephemeral")
+            self.rpc.thread["ephemeral"] = False
+            self.rpc.queued = [{"id": "user-message"}]
+            self.assertEqual(fallback.inspect(event, self.rpc), "user_input_queued")
+
+    def test_herdr_send_uses_target_from_final_inspection(self):
+        fallback = whipper.HerdrFallback([TID], "herdr")
+        fallback.targets[TID] = {}, "old-pane", os.getpid()
+        def inspect(event, rpc):
+            fallback.targets[TID] = {}, "rechecked-pane", os.getpid()
+            return "ready"
+        with patch.object(fallback, "inspect", side_effect=inspect), \
+                patch.object(fallback, "run", return_value={}) as run, \
+                patch.object(fallback, "latest", return_value={"id": NEXT}):
+            fallback.send({"thread_id": TID, "turn_id": TURN}, "keep doing", self.rpc)
+        run.assert_called_once_with({}, "agent", "prompt", "rechecked-pane", "keep doing")
 
     def test_new_state_skips_history_unless_lookback_requested(self):
         self.add_error()

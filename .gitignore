@@ -8,6 +8,7 @@
 venv/
 __pycache__/
 *.py[cod]
+.ruff_cache/
 
 # Runtime data can contain local paths, prompts, and session identifiers.
 logs/

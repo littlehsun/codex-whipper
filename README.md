@@ -61,7 +61,7 @@ chmod 600 .env
 | `WHIPPER_DATABASE` | 留白使用 Codex home 下的 `logs_2.sqlite`。 |
 | `WHIPPER_SOCKET` | 留白使用 Codex home 下的 `app-server-control/app-server-control.sock`。 |
 | `WHIPPER_STATE` | 留白使用 `~/.local/state/codex-whipper/state.json`；dry-run 使用獨立狀態檔。 |
-| `WHIPPER_THREADS` | 留白監控 shared server 的所有合格主 sessions；填入 UUID 可縮小範圍。 |
+| `WHIPPER_THREADS` | 留白監控 shared server 的所有合格主 sessions；填入 UUID 可縮小範圍，此限制也套用到 Herdr targets。 |
 | `WHIPPER_HERDR_THREADS` | 明確允許透過 Herdr 操作的 standalone CLI UUID；留白關閉此功能。 |
 | `WHIPPER_HERDR_BIN` | Herdr 執行檔；預設 `~/.local/bin/herdr`，也可填 PATH 中的 `herdr`。 |
 | `WHIPPER_MESSAGE` | 重試訊息；預設 `keep doing`。 |
@@ -96,7 +96,7 @@ Herdr 可透過明確的 pane ID 查看 session（在你自己的 Herdr 環境�
 herdr agent get <pane-id>
 ```
 
-使用回傳的 `agent.agent_session.value` 作為 UUID。Script 從原 process 讀取 pane/socket，核對 foreground PID、session UUID、idle/done、最新 capacity failure 及空白輸入框。blocked、unknown、有未送出文字或 session 已替換時不送出；不切換焦點、不重啟 CLI、不回答 approval。
+使用回傳的 `agent.agent_session.value` 作為 UUID。Script 從原 process 讀取 pane/socket，核對 foreground PID、session UUID、idle/done、主 session 範圍、最新 capacity failure、沒有 queued input 及空白輸入框。blocked、unknown、有未送出文字或 session 已替換時不送出；不切換焦點、不重啟 CLI、不回答 approval。
 
 Herdr 的 `agent prompt` 回報送出後，還必須讀到新 turn ID 才算 accepted。其他獨立 app-server 及遠端主機不會自動套用本機 fallback。
 
@@ -110,6 +110,8 @@ Herdr 的 `agent prompt` 回報送出後，還必須讀到新 turn ID 才算 acc
 預設間隔為 **60、120、240、300、300 秒**，最多 5 次。只有自己啟動的下一輪又出現 capacity failure 才延續重試計數；新的使用者 turn 另算。成功送出不代表模型一定可用，容量仍滿時會再進入此流程。
 
 State 用 atomic rename、fsync 和檔案鎖保存 cursor、待處理事件與重試鏈。請勿用不同 state 同時啟動多個正式 watcher 監控同一 session。
+
+重啟後既有待處理事件也會套用目前的 thread 範圍與重試上限；縮小範圍或降低上限，不會沿用舊授權送出。若自行指定 state 路徑，請放在倉庫外或被 Git 忽略的資料夾。
 
 Dry-run 不使用 live state：預設是 `dry-run.json`；如果在 `.env` 或 CLI 指定 `live.json`，dry-run 自動使用旁邊的 `live.dry-run.json`。`--once` 不等待尚未到期的事件；事件保留在其 state，後續執行會接續。
 
@@ -130,7 +132,7 @@ INFO sent thread=<session-uuid> cwd="/work/project" turn=<new-turn-uuid> attempt
 
 `cwd` 來自 session metadata，不是 shared daemon 的 process folder；無法取得時顯示 `<unknown>`，不阻止重試。
 
-主 log 與一份 `.1` 備份各最多 **500,000 bytes**，合計最多 **1,000,000 bytes（1 MB）**。按 UTF-8 bytes 輪替；單筆過長訊息會截斷。Logs/state 可能含資料夾、訊息或 session IDs，都不應上傳或 commit。
+主 log 與一份 `.1` 備份各最多 **500,000 bytes**，合計最多 **1,000,000 bytes（1 MB）**。按 UTF-8 bytes 輪替；單筆過長訊息會截斷。啟動時若既有 log 超過限制，會先移除最舊紀錄。Logs/state 可能含資料夾、訊息或 session IDs，都不應上傳或 commit。
 
 ## Systemd 背景服務
 
