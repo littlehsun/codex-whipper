@@ -61,7 +61,8 @@ chmod 600 .env
 | `WHIPPER_DATABASE` | 留白使用 Codex home 下的 `logs_2.sqlite`。 |
 | `WHIPPER_SOCKET` | 留白使用 Codex home 下的 `app-server-control/app-server-control.sock`。 |
 | `WHIPPER_STATE` | 留白使用 `~/.local/state/codex-whipper/state.json`；dry-run 使用獨立狀態檔。 |
-| `WHIPPER_THREADS` | 留白監控 shared server 的所有合格主 sessions；填入 UUID 可縮小範圍，此限制也套用到 Herdr targets。 |
+| `WHIPPER_THREADS` | 留白監控 shared server 的所有合格 sessions（子 session 需另啟用）；填入 UUID 可縮小範圍，此限制也套用到 Herdr targets。 |
+| `WHIPPER_SUBAGENTS` | 預設 `false`；啟用 shared-server 子 session 續跑及 review 重送。限制 UUID 時，review 的子／主 UUID 都必須列入。 |
 | `WHIPPER_HERDR_THREADS` | 明確允許透過 Herdr 操作的 standalone CLI UUID；留白關閉此功能。 |
 | `WHIPPER_HERDR_BIN` | Herdr 執行檔；預設 `~/.local/bin/herdr`，也可填 PATH 中的 `herdr`。 |
 | `WHIPPER_MESSAGE` | 重試訊息；預設 `keep doing`。 |
@@ -86,7 +87,9 @@ Boolean 接受 `true/false`，亦接受 `1/0`、`yes/no`、`on/off`。CLI 可用
 
 ## Session 範圍與 Herdr
 
-Shared app-server 路徑只處理目前載入、接受直接輸入的主 session。Subagent、內部／ephemeral session、不同 app-server process、已有新 turn 或其他錯誤會跳過；active session 不會故意被 steer。
+Shared app-server 預設處理目前載入、接受直接輸入的主 session。設定 `WHIPPER_SUBAGENTS=true` 可納入同一 server 的一般子 session，仍要求已載入、接受直接輸入、最新 turn 為 capacity failure 且沒有排隊輸入。內部／ephemeral session、不同 app-server process、已有新 turn 或其他錯誤會跳過；active session 不會故意被 steer。
+
+Review 子 session 可在卸載後恢復：從本機 rollout 核對子／主 session 與原始主 turn，讀取失敗 reviewer 的原始文字輸入，以 `review/start` 的 `custom` target 在主 session 重新審查。這會重跑審查，不會從中斷點接續；未保留原始 target 類型，因此只在能取回完整文字要求時重送。主 session 必須閒置、原 review 仍為最新失敗／中斷 turn，子／主 session 都不得有排隊輸入；已重新 review、已有新 turn 或找不到完整來源時會跳過。Review 重試計數依主 session 保存，沿用相同退避、次數上限與不確定送出防護。Herdr 仍只處理明確允許的主 session。
 
 本機 standalone CLI 沒有 shared socket 時，可以在 `.env` 的 `WHIPPER_HERDR_THREADS` 加入要授權的 UUID。這表示允許 script 在該 Herdr terminal 送出重試訊息，包含從背景服務操作。
 
@@ -169,7 +172,7 @@ systemctl --user disable --now codex-whipper.service
 - **改設定但沒生效**：確認 CLI／process environment 沒有覆蓋 `.env`；service 舊 drop-in 也可能覆蓋 ExecStart。
 - **容量一直滿**：達到 retry limit 後停止；此工具不能保證或增加模型容量。
 - 狀態檢查與訊息送出不是同一個原子操作，同時手動操作仍有競態。只將準備允許繼續工作的 sessions 交給 watcher。
-- `/proc` 和 `fcntl` 目前使此專案限定 Linux；尚未提供 macOS/Windows、remote host 或 subagent recovery。
+- `/proc` 和 `fcntl` 目前使此專案限定 Linux；尚未提供 macOS/Windows 或 remote host。
 
 ## 開發與驗證
 

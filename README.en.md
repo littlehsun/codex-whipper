@@ -61,7 +61,8 @@ Precedence: **CLI options > process environment > `.env` > built-in defaults**.
 | `WHIPPER_DATABASE` | Blank derives `logs_2.sqlite` from Codex home. |
 | `WHIPPER_SOCKET` | Blank derives `app-server-control/app-server-control.sock` from Codex home. |
 | `WHIPPER_STATE` | Blank uses `~/.local/state/codex-whipper/state.json`; dry-run gets separate state. |
-| `WHIPPER_THREADS` | Blank monitors eligible shared-server root sessions; UUIDs restrict the scope, including Herdr targets. |
+| `WHIPPER_THREADS` | Blank monitors eligible shared-server sessions (children require opt-in); UUIDs restrict the scope, including Herdr targets. |
+| `WHIPPER_SUBAGENTS` | Default `false`; enable shared-server child continuation and review retries. When restricting UUIDs, include both child and parent for reviews. |
 | `WHIPPER_HERDR_THREADS` | Explicit allowlist for Herdr-controlled standalone CLI sessions. Blank disables the fallback. |
 | `WHIPPER_HERDR_BIN` | Herdr executable; default `~/.local/bin/herdr`, or set `herdr` to use PATH. |
 | `WHIPPER_MESSAGE` | Retry prompt; default `keep doing`. |
@@ -86,7 +87,9 @@ Booleans accept `true/false`, `1/0`, `yes/no`, or `on/off`. Override enabled fil
 
 ## Session scope and Herdr
 
-The shared-server path handles loaded root sessions that accept direct input. It skips subagents, internal/ephemeral sessions, another server process, changed turns, or other errors. It does not intentionally steer an active session.
+The shared-server path handles loaded root sessions that accept direct input. Set `WHIPPER_SUBAGENTS=true` to include ordinary children on the same server, still requiring a loaded thread, direct-input capability, a latest capacity-failed turn, and no queued input. Internal/ephemeral sessions, another server process, changed turns, and other errors are skipped. It does not intentionally steer an active session.
+
+Review children can recover after unloading: verify the child, parent, and original parent turn against the local rollout, then replay the failed reviewer’s original text input using `review/start` with a `custom` target on the parent. This reruns the review rather than resuming its interrupted execution. The original target type is not retained; only complete text requests qualify. The parent must be idle with the original failed/interrupted review still current, and neither thread may have queued input. Newer reviews/turns or missing origin/input cause a skip. Review retry chains are stored under the parent and retain the same backoff, limits, and uncertain-dispatch protections. Herdr remains restricted to explicitly allowed root sessions.
 
 For a local standalone CLI without the shared socket, add its UUID to `WHIPPER_HERDR_THREADS` in `.env`. This explicitly permits submitting retry prompts to that Herdr terminal, including from a background service.
 
@@ -169,7 +172,7 @@ The installer rejects existing `.service.d/*.conf` drop-ins: review and remove o
 - **Configuration not taking effect:** check CLI/process-environment overrides and old systemd drop-ins overriding ExecStart.
 - **Repeated capacity failures:** retries stop at the limit. This tool cannot increase or guarantee model capacity.
 - State checks and submission are separate operations. Concurrent manual input can still race; only monitor sessions you intend to continue automatically.
-- `/proc` and `fcntl` currently restrict this project to Linux. macOS/Windows, remote hosts, and subagent recovery are not implemented.
+- `/proc` and `fcntl` currently restrict this project to Linux. macOS/Windows and remote hosts are not implemented.
 
 ## Development and validation
 

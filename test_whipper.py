@@ -14,6 +14,8 @@ import whipper
 TID = "11111111-1111-7111-8111-111111111111"
 TURN = "22222222-2222-7222-8222-222222222222"
 NEXT = "33333333-3333-7333-8333-333333333333"
+PARENT = "55555555-5555-7555-8555-555555555555"
+ROOT_TURN = "66666666-6666-7666-8666-666666666666"
 NOW = 1000
 
 
@@ -165,6 +167,164 @@ class WatcherTests(unittest.TestCase):
         self.rpc.thread["parentThreadId"] = TID
         self.watcher.tick(NOW + 121)
         self.assertEqual(self.rpc.sends, [])
+
+    def test_opted_in_subagent_retries_with_existing_guards(self):
+        self.args.subagents = True
+        self.rpc.thread.update(parentThreadId=PARENT, source={"subAgent": {"thread_spawn": {"parent_thread_id": PARENT, "depth": 1}}})
+        self.add_error()
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(len(self.rpc.sends), 1)
+
+    def test_opted_in_internal_or_ephemeral_still_excluded(self):
+        for thread in [{"source": {"internal": "compaction"}}, {"ephemeral": True},
+                       {"parentThreadId": PARENT, "source": {"subAgent": "compact"}},
+                       {"parentThreadId": PARENT, "source": {"subAgent": "memory_consolidation"}}]:
+            self.assertIsNotNone(whipper.excluded_thread(thread, allow_subagents=True))
+
+    def setup_review(self):
+        self.args.subagents = True
+        self.args.codex_home = self.root
+        path = self.root / "sessions/reviewer.jsonl"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": TID, "parent_thread_id": PARENT,
+        }}) + "\n" + json.dumps({"type": "turn_context", "payload": {
+            "turn_id": TURN, "root_turn_id": ROOT_TURN,
+        }}) + "\n")
+        self.rpc.thread.update(parentThreadId=PARENT, source={"subAgent": "review"},
+                               path=str(path), status={"type": "notLoaded"}, canAcceptDirectInput=None)
+        self.rpc.turn["items"] = [{"type": "userMessage", "content": [{"type": "text", "text": "Review request 42"}]}]
+        self.parent_thread = {"source": "cli", "status": {"type": "idle"}, "canAcceptDirectInput": True}
+        self.parent_turn = {"id": ROOT_TURN, "status": "failed", "items": [{"type": "enteredReviewMode", "review": "Review request 42"}]}
+        self.review_sends = []
+        self.parent_queue = []
+        call = self.rpc.call
+        def route(method, params):
+            if params.get("threadId") == PARENT:
+                if method == "thread/read":
+                    return {"thread": self.parent_thread}
+                if method == "thread/turns/list":
+                    return {"data": [self.parent_turn]}
+                if method == "thread/queue/list":
+                    return {"data": self.parent_queue}
+                if method == "review/start":
+                    self.review_sends.append(params)
+                    if self.rpc.fail_send:
+                        raise TimeoutError("uncertain review submission")
+                    return {"turn": {"id": NEXT}, "reviewThreadId": PARENT}
+            return call(method, params)
+        self.rpc.call = route
+        self.add_error()
+
+    def test_review_restart_uses_original_input_and_parent_not_child(self):
+        self.setup_review()
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.rpc.sends, [])
+        self.assertEqual(self.review_sends, [{"threadId": PARENT, "delivery": "inline", "target": {
+            "type": "custom", "instructions": "Review request 42"}}])
+        self.assertEqual(self.state.data["retries"][PARENT]["transport"], "review")
+        self.state.data["cursor"] = 0
+        self.watcher.tick(NOW + 61)
+        self.assertEqual(len(self.review_sends), 1)
+
+    def test_review_newer_parent_turn_skips(self):
+        self.setup_review()
+        self.parent_turn["id"] = NEXT
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+        self.assertFalse(self.state.data["pending"])
+
+    def test_review_active_parent_waits_then_sends(self):
+        self.setup_review()
+        self.parent_thread["status"]["type"] = "active"
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+        self.assertIn(TID, self.state.data["pending"])
+        self.parent_thread["status"]["type"] = "idle"
+        self.watcher.tick(NOW + 65)
+        self.assertEqual(len(self.review_sends), 1)
+
+    def test_review_queued_parent_input_skips(self):
+        self.setup_review()
+        self.parent_queue.append({"id": "user-input"})
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+
+    def test_review_missing_origin_or_input_does_not_guess(self):
+        self.setup_review()
+        Path(self.rpc.thread["path"]).write_text("")
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+
+    def test_review_uncertain_dispatch_is_not_replayed(self):
+        self.setup_review()
+        self.rpc.fail_send = True
+        self.watcher.tick(NOW + 60)
+        self.state.data["cursor"] = 0
+        self.watcher.tick(NOW + 120)
+        self.assertEqual(len(self.review_sends), 1)
+        self.assertEqual(self.state.data["retries"][PARENT]["outcome"], "uncertain_or_rejected")
+
+    def test_review_retry_chain_obeys_backoff_and_limit(self):
+        self.setup_review()
+        self.state.data["retries"][PARENT] = {"attempts": 2, "expected_turn": ROOT_TURN, "outcome": "accepted"}
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+        self.watcher.tick(NOW + 240)
+        self.assertEqual(len(self.review_sends), 1)
+        self.assertEqual(self.state.data["retries"][PARENT]["attempts"], 3)
+
+    def test_review_limit_survives_reviewer_thread_changes(self):
+        self.setup_review()
+        self.state.data["retries"][PARENT] = {"attempts": 5, "expected_turn": ROOT_TURN, "outcome": "accepted"}
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+        self.assertFalse(self.state.data["pending"])
+
+    def test_review_recheck_catches_newer_parent_turn(self):
+        self.setup_review()
+        original = self.watcher.inspect_review
+        def inspect(event, thread):
+            result = original(event, thread)
+            self.parent_turn["id"] = NEXT
+            return result
+        with patch.object(self.watcher, "inspect_review", side_effect=inspect):
+            self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+        self.assertFalse(self.state.data["pending"])
+
+    def test_review_recheck_disconnect_keeps_pending_without_sending(self):
+        self.setup_review()
+        original = self.watcher.inspect
+        calls = 0
+        def inspect(event):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise TimeoutError("inspection disconnected")
+            return original(event)
+        with patch.object(self.watcher, "inspect", side_effect=inspect):
+            self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+        self.assertIn(TID, self.state.data["pending"])
+
+    def test_review_missing_input_or_mismatched_rollout_identity_skips(self):
+        self.setup_review()
+        self.rpc.turn["items"] = []
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
+        self.rpc.turn["items"] = [{"type": "userMessage", "content": [{"type": "text", "text": "review"}]}]
+        path = Path(self.rpc.thread["path"])
+        path.write_text(path.read_text().replace(PARENT, NEXT))
+        self.state.data["cursor"] = 0
+        self.watcher.tick(NOW + 120)
+        self.assertEqual(self.review_sends, [])
+
+    def test_review_parent_scope_is_checked_separately(self):
+        self.setup_review()
+        self.args.thread = [TID]
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.review_sends, [])
 
     def test_queued_user_input_skips(self):
         self.add_error()

@@ -61,15 +61,29 @@ def cwd_field(event):
     return json.dumps(event.get("cwd") or "<unknown>", ensure_ascii=False)
 
 
-def excluded_thread(thread):
-    """Apply root-session scope to both transports."""
+def excluded_thread(thread, allow_subagents=False):
+    """Herdr remains root-only; shared-server children require explicit opt-in."""
     source = thread.get("source")
-    if thread.get("parentThreadId") or (isinstance(source, dict) and any(
-            k in source for k in ["subAgent", "subagent", "internal"])):
+    if isinstance(source, dict) and "internal" in source:
         return "subagent_or_internal"
+    if thread.get("parentThreadId") or (isinstance(source, dict) and any(
+            k in source for k in ["subAgent", "subagent"])):
+        if not allow_subagents:
+            return "subagent_or_internal"
+        child = source.get("subAgent", source.get("subagent")) if isinstance(source, dict) else None
+        # Compaction, memory maintenance, and unknown internal workers are not
+        # ordinary delegated work and must not receive continuation prompts.
+        if not thread.get("parentThreadId") or not (
+                child == "review" or isinstance(child, dict) and "thread_spawn" in child):
+            return "subagent_or_internal"
     if thread.get("ephemeral"):
         return "ephemeral"
     return None
+
+
+def is_review(thread):
+    source = thread.get("source")
+    return isinstance(source, dict) and (source.get("subAgent") == "review" or source.get("subagent") == "review")
 
 
 class RpcError(RuntimeError):
@@ -346,6 +360,28 @@ class Watcher:
         except Exception:
             return None
 
+    def review_origin(self, thread, event):
+        """Read identity fields only; never replay rollout instructions or tool calls."""
+        path = Path(thread.get("path") or "").resolve()
+        if not path.is_relative_to((self.args.codex_home / "sessions").resolve()):
+            return None
+        consumed = 0
+        identity = False
+        with path.open() as stream:
+            for line in stream:
+                consumed += len(line)
+                if consumed > 8_000_000:
+                    break
+                record = json.loads(line)
+                payload = record.get("payload", {})
+                if record.get("type") == "session_meta":
+                    identity = (payload.get("id") == event["thread_id"] and
+                                payload.get("parent_thread_id") == thread.get("parentThreadId"))
+                if (record.get("type") in {"turn_context", "event_msg"} and
+                        payload.get("turn_id") == event["turn_id"] and payload.get("root_turn_id")):
+                    return payload["root_turn_id"] if identity else None
+        return None
+
     def ingest(self, now):
         d = self.state.data
         snapshot = self.store.latest_id()
@@ -364,10 +400,20 @@ class Watcher:
                 continue
             if now - event["ts"] > self.args.max_age:
                 continue
+            if self.args.subagents:
+                try:
+                    thread = self.rpc.call("thread/read", {"threadId": tid, "includeTurns": False})["thread"]
+                    if is_review(thread) and thread.get("parentThreadId"):
+                        root_turn = self.review_origin(thread, event)
+                        if root_turn:
+                            event.update(review_parent=thread["parentThreadId"], root_turn=root_turn)
+                except Exception as e:
+                    # Keep the event; inspection retries transient transport failures.
+                    LOG.warning("origin_lookup_failed thread=%s error=%s", tid, type(e).__name__)
             pending = d["pending"].get(tid)
             if pending and pending["turn_id"] == event["turn_id"]:
                 continue
-            previous = d["retries"].get(tid, {})
+            previous = d["retries"].get(event.get("review_parent", tid), {})
             if previous.get("failure_turn") == event["turn_id"]:
                 continue
             if tid not in folders:
@@ -377,7 +423,7 @@ class Watcher:
                 LOG.warning("unresolved_dispatch thread=%s cwd=%s; inspect before resetting state", tid, cwd_field(event))
                 continue
             # Only failures of our own retry turn continue the retry count.
-            attempts = previous.get("attempts", 0) if previous.get("expected_turn") == event["turn_id"] else 0
+            attempts = previous.get("attempts", 0) if previous.get("expected_turn") == event.get("root_turn", event["turn_id"]) else 0
             if attempts >= self.args.max_retries:
                 d["pending"].pop(tid, None)
                 LOG.warning("retry_limit thread=%s cwd=%s turn=%s attempts=%s", tid, cwd_field(event), event["turn_id"], attempts)
@@ -398,9 +444,11 @@ class Watcher:
         thread = self.rpc.call("thread/read", {"threadId": tid, "includeTurns": False})["thread"]
         if isinstance(thread.get("cwd"), str) and thread["cwd"]:
             event["cwd"] = thread["cwd"]
-        reason = excluded_thread(thread)
+        reason = excluded_thread(thread, self.args.subagents)
         if reason:
             return reason
+        if is_review(thread):
+            return self.inspect_review(event, thread)
         if thread.get("status", {}).get("type") == "notLoaded":
             return "not_loaded"
         if thread.get("canAcceptDirectInput") is not True:
@@ -423,6 +471,69 @@ class Watcher:
         # A failed turn can leave a loaded thread in systemError. Its latest
         # failure and direct-input capability were checked above.
         return "ready" if status in {"idle", "systemError"} else "wait"
+
+    def inspect_review(self, event, thread):
+        """Restart a failed reviewer on its unchanged, idle parent thread."""
+        parent = thread.get("parentThreadId")
+        if not self.args.subagents or not parent:
+            return "review_origin_unavailable"
+        if self.args.thread and parent not in self.args.thread:
+            return "review_parent_outside_scope"
+        root_turn = self.review_origin(thread, event)
+        if not root_turn:
+            return "review_origin_unavailable"
+        event.update(review_parent=parent, root_turn=root_turn)
+        previous = self.state.data["retries"].get(parent, {})
+        if previous.get("outcome") in {"dispatching", "uncertain_or_rejected"}:
+            return "unresolved_review_dispatch"
+        if previous.get("failure_turn") == event["turn_id"]:
+            return "review_already_consumed"
+        event["attempts"] = previous.get("attempts", 0) if previous.get("expected_turn") == root_turn else 0
+        if event["attempts"] >= self.args.max_retries:
+            return "retry_limit"
+        turns = self.rpc.call("thread/turns/list", {
+            "threadId": event["thread_id"], "limit": 1, "sortDirection": "desc", "itemsView": "full",
+        })["data"]
+        if not turns or turns[0]["id"] != event["turn_id"]:
+            return "newer_turn_or_no_turn"
+        turn = turns[0]
+        if turn.get("status") == "inProgress":
+            return "wait"
+        if turn.get("status") != "failed" or CAPACITY not in (turn.get("error") or {}).get("message", ""):
+            return "latest_turn_not_capacity_failed"
+        messages = [item for item in turn.get("items", []) if item.get("type") == "userMessage"]
+        if len(messages) != 1:
+            return "review_input_unavailable"
+        content = messages[0].get("content", [])
+        if not content or any(item.get("type") != "text" for item in content):
+            return "review_input_unavailable"
+        instructions = "\n".join(item.get("text", "") for item in content)
+        if not instructions.strip() or len(instructions) > 100_000:
+            return "review_input_unavailable"
+        parent_thread = self.rpc.call("thread/read", {"threadId": parent, "includeTurns": False})["thread"]
+        if excluded_thread(parent_thread) or parent_thread.get("canAcceptDirectInput") is not True:
+            return "review_parent_unavailable"
+        turns = self.rpc.call("thread/turns/list", {
+            "threadId": parent, "limit": 2, "sortDirection": "desc", "itemsView": "full",
+        })["data"]
+        if not turns or turns[0]["id"] not in {root_turn, event["turn_id"]}:
+            return "review_parent_has_newer_turn"
+        root = next((turn for turn in turns if turn["id"] == root_turn), None)
+        if not root:
+            return "review_origin_unavailable"
+        if not any(item.get("type") == "enteredReviewMode" for item in root.get("items", [])):
+            return "review_origin_unavailable"
+        if root.get("status") == "completed":
+            return "review_parent_already_completed"
+        for tid in (parent, event["thread_id"]):
+            if self.rpc.call("thread/queue/list", {"threadId": tid, "limit": 1})["data"]:
+                return "user_input_queued"
+        if parent_thread.get("status", {}).get("type") not in {"idle", "systemError"}:
+            return "wait"
+        if root.get("status") not in {"failed", "interrupted"}:
+            return "wait"
+        event["review_target"] = {"type": "custom", "instructions": instructions}
+        return "ready"
 
     def tick(self, now=None):
         now = time.time() if now is None else now
@@ -453,6 +564,10 @@ class Watcher:
                 continue
             try:
                 decision = self.herdr.inspect(event, self.rpc) if use_herdr else self.inspect(event)
+                # Review recovery targets the parent, so recheck immediately
+                # before consumption; transport errors remain retryable here.
+                if decision == "ready" and event.get("review_parent"):
+                    decision = self.inspect(event)
             except Exception as e:
                 self.rpc.close()
                 LOG.warning("inspect_failed thread=%s cwd=%s error=%s", tid, cwd_field(event), e)
@@ -466,8 +581,12 @@ class Watcher:
             if decision != "ready":
                 self.discard(tid, decision)
                 continue
+            if event.get("review_parent") and now < event["ts"] + self.delay(event["attempts"]):
+                event["due"] = event["ts"] + self.delay(event["attempts"])
+                self.state.save()
+                continue
             if self.args.dry_run:
-                LOG.info("dry_run would_send thread=%s cwd=%s failed_turn=%s message=%r", tid, cwd_field(event), event["turn_id"], self.args.message)
+                LOG.info("dry_run would_send thread=%s cwd=%s failed_turn=%s transport=%s", tid, cwd_field(event), event["turn_id"], "review" if event.get("review_parent") else "continuation")
                 self.discard(tid, "dry_run_checked")
                 continue
             # Persist consumption BEFORE sending. A timeout may mean it was accepted;
@@ -476,12 +595,16 @@ class Watcher:
             retry = {"attempts": event["attempts"] + 1, "expected_turn": None,
                      "failure_turn": event["turn_id"], "sent_at": now, "outcome": "dispatching",
                      "cwd": event.get("cwd"),
-                     "transport": "herdr" if use_herdr else "app-server"}
-            self.state.data["retries"][tid] = retry
+                     "transport": "herdr" if use_herdr else "review" if event.get("review_parent") else "app-server"}
+            self.state.data["retries"][event.get("review_parent", tid)] = retry
             self.state.save()
             try:
                 if use_herdr:
                     result = self.herdr.send(event, self.args.message, self.rpc)
+                elif event.get("review_parent"):
+                    result = self.rpc.call("review/start", {
+                        "threadId": event["review_parent"], "delivery": "inline", "target": event["review_target"],
+                    })
                 else:
                     result = self.rpc.call("turn/start", {
                         "threadId": tid,
@@ -489,7 +612,7 @@ class Watcher:
                         "clientUserMessageId": str(uuid.uuid4()),
                     })
                 retry.update(expected_turn=result["turn"]["id"], outcome="accepted")
-                LOG.info("sent thread=%s cwd=%s turn=%s attempt=%s", tid, cwd_field(event), retry["expected_turn"], retry["attempts"])
+                LOG.info("sent thread=%s cwd=%s turn=%s attempt=%s transport=%s parent=%s", tid, cwd_field(event), retry["expected_turn"], retry["attempts"], retry["transport"], event.get("review_parent", "-"))
             except Exception as e:
                 self.rpc.close()
                 retry["outcome"] = "uncertain_or_rejected"
@@ -514,7 +637,7 @@ def parse_args(argv=None):
             except ValueError as e:
                 raise ValueError(f"WHIPPER_{name} must be a number") from e
         boolean_defaults = {key: boolean_setting(settings, "WHIPPER_" + key) for key in
-                            ["DRY_RUN", "ONCE", "RECONCILE_ON_START"]}
+                            ["DRY_RUN", "ONCE", "RECONCILE_ON_START", "SUBAGENTS"]}
         numeric_defaults = {key: number(key, default, convert) for key, default, convert in [
             ("DELAY", 60, float), ("MAX_DELAY", 300, float), ("MAX_RETRIES", 5, int),
             ("MAX_AGE", 1800, float), ("POLL", 5, float), ("LOOKBACK", 0, float),
@@ -538,9 +661,11 @@ def parse_args(argv=None):
     parser.add_argument("--lookback", type=float, default=numeric_defaults["LOOKBACK"], help="Seconds of history to inspect with a NEW state file")
     parser.add_argument("--reconcile-on-start", action=argparse.BooleanOptionalAction, default=boolean_defaults["RECONCILE_ON_START"], help="Also rescan lookback history with existing state")
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=boolean_defaults["DRY_RUN"], help="Inspect without sending messages")
+    parser.add_argument("--subagents", action=argparse.BooleanOptionalAction, default=boolean_defaults["SUBAGENTS"], help="Retry shared-server children, including restarting failed reviews on their parent")
     parser.add_argument("--once", action=argparse.BooleanOptionalAction, default=boolean_defaults["ONCE"], help="Process due events once, then exit")
     parser.add_argument("--doctor", action="store_true", help="Read-only database/socket/protocol check")
     args = parser.parse_args(argv)
+    args.codex_home = home.resolve()
     args.thread = list_setting(settings, "WHIPPER_THREADS") if args.thread is None else args.thread
     args.herdr_thread = list_setting(settings, "WHIPPER_HERDR_THREADS") if args.herdr_thread is None else args.herdr_thread
     if not all(math.isfinite(v) for v in [args.poll, args.delay, args.max_delay, args.max_age, args.lookback]) or args.poll <= 0 or args.delay <= 0 or args.max_delay < args.delay or args.max_retries <= 0 or args.max_age <= 0 or args.lookback < 0 or not args.message.strip():

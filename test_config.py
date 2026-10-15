@@ -44,6 +44,12 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(self.args().state, self.root / "live.dry-run.json")
         self.assertEqual(self.args("--no-dry-run").state, state)
 
+    def test_subagents_require_opt_in_and_allow_cli_override(self):
+        self.assertFalse(self.args().subagents)
+        self.file.write_text("WHIPPER_SUBAGENTS=true\n")
+        self.assertTrue(self.args().subagents)
+        self.assertFalse(self.args("--no-subagents").subagents)
+
     def test_paths_relative_to_project_and_home_expansion(self):
         self.file.write_text('WHIPPER_LOG_FILE="logs/example log.txt"\nWHIPPER_HERDR_BIN=~/.local/bin/herdr\n')
         from env_config import ROOT
