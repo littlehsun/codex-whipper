@@ -115,11 +115,11 @@ class WatcherTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def add_error(self, turn=TURN, ts=NOW, pid=None, body=None, target="codex_core::session::turn"):
+    def add_error(self, turn=TURN, ts=NOW, pid=None, body=None, target="codex_core::session::turn", error=whipper.CAPACITY):
         if pid is None:
             pid = os.getpid()
         if body is None:
-            body = f'turn{{thread.id={TID} turn.id={turn}}}: Turn error: {whipper.CAPACITY}.'
+            body = f'turn{{thread.id={TID} turn.id={turn}}}: Turn error: {error}.'
         with sqlite3.connect(self.db) as c:
             c.execute("INSERT INTO logs(ts,target,thread_id,process_uuid,feedback_log_body) VALUES(?,?,?,?,?)",
                       (ts, target, TID, f"pid:{pid}:process-id", body))
@@ -144,6 +144,73 @@ class WatcherTests(unittest.TestCase):
         self.add_error(ts=NOW + 61)  # duplicate logging of consumed failure
         self.watcher.tick(NOW + 121)
         self.assertEqual(len(self.rpc.sends), 1)
+
+    def test_stream_request_failure_retries_once_after_delay(self):
+        self.rpc.turn["error"]["message"] = whipper.STREAM_REQUEST_ERROR
+        self.add_error(error=whipper.STREAM_REQUEST_ERROR)
+        self.watcher.tick(NOW)
+        self.assertEqual(self.state.data["pending"][TID]["error_kind"], "stream_request")
+        self.assertEqual(self.rpc.sends, [])
+        self.watcher.tick(NOW + 60)
+        self.add_error(error=whipper.STREAM_REQUEST_ERROR)
+        self.watcher.tick(NOW + 120)
+        self.assertEqual(len(self.rpc.sends), 1)
+
+    def test_stream_sampling_retries_and_prompt_mentions_are_not_failures(self):
+        self.add_error(error=whipper.STREAM_REQUEST_ERROR, target="codex_core::responses_retry")
+        self.add_error(body=f'User prompt: {whipper.STREAM_REQUEST_ERROR}')
+        self.add_error(body=f'turn{{turn.id={TURN}}}: Turn error: unrelated error; quoted {whipper.STREAM_REQUEST_ERROR}')
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.rpc.sends, [])
+        self.assertFalse(self.state.data["pending"])
+
+    def test_other_stream_errors_are_not_retryable(self):
+        for message in ["stream disconnected before completion: authentication failed",
+                        "error sending request", "Usage limit exceeded",
+                        whipper.STREAM_REQUEST_ERROR + "ed"]:
+            with self.subTest(message=message):
+                self.assertIsNone(whipper.retryable_error(message))
+
+    def test_stream_active_or_superseded_turn_never_gets_prompted(self):
+        self.rpc.turn["error"]["message"] = whipper.STREAM_REQUEST_ERROR
+        self.rpc.thread["status"]["type"] = "active"
+        self.add_error(error=whipper.STREAM_REQUEST_ERROR)
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(self.rpc.sends, [])
+        self.assertIn(TID, self.state.data["pending"])
+        self.rpc.thread["status"]["type"] = "idle"
+        self.rpc.turn["id"] = NEXT
+        self.watcher.tick(NOW + 65)
+        self.assertEqual(self.rpc.sends, [])
+        self.assertFalse(self.state.data["pending"])
+
+    def test_mixed_stream_and_capacity_chain_retains_backoff_and_limit(self):
+        self.args.max_retries = 2
+        self.rpc.turn["error"]["message"] = whipper.STREAM_REQUEST_ERROR
+        self.add_error(error=whipper.STREAM_REQUEST_ERROR)
+        self.watcher.tick(NOW + 60)
+        self.rpc.turn.update(id=NEXT, error={"message": whipper.CAPACITY})
+        self.add_error(turn=NEXT, ts=NOW + 61)
+        self.watcher.tick(NOW + 121)
+        self.assertEqual(len(self.rpc.sends), 1)
+        self.watcher.tick(NOW + 181)
+        self.assertEqual(len(self.rpc.sends), 2)
+        last = "44444444-4444-7444-8444-444444444444"
+        self.rpc.turn.update(id=last, error={"message": whipper.STREAM_REQUEST_ERROR})
+        self.add_error(turn=last, ts=NOW + 182, error=whipper.STREAM_REQUEST_ERROR)
+        self.watcher.tick(NOW + 500)
+        self.assertEqual(len(self.rpc.sends), 2)
+        self.assertFalse(self.state.data["pending"])
+
+    def test_stream_uncertain_dispatch_does_not_get_replayed(self):
+        self.rpc.turn["error"]["message"] = whipper.STREAM_REQUEST_ERROR
+        self.rpc.fail_send = True
+        self.add_error(error=whipper.STREAM_REQUEST_ERROR)
+        self.watcher.tick(NOW + 60)
+        self.state.data["cursor"] = 0
+        self.watcher.tick(NOW + 120)
+        self.assertEqual(len(self.rpc.sends), 1)
+        self.assertEqual(self.state.data["retries"][TID]["outcome"], "uncertain_or_rejected")
 
     def test_newer_turn_skips(self):
         self.add_error()
@@ -226,6 +293,23 @@ class WatcherTests(unittest.TestCase):
         self.state.data["cursor"] = 0
         self.watcher.tick(NOW + 61)
         self.assertEqual(len(self.review_sends), 1)
+
+    def test_stream_failed_review_uses_review_restart(self):
+        self.setup_review()
+        self.rpc.turn["error"]["message"] = whipper.STREAM_REQUEST_ERROR
+        with sqlite3.connect(self.db) as c:
+            c.execute("UPDATE logs SET feedback_log_body=replace(feedback_log_body,?,?)",
+                      (whipper.CAPACITY, whipper.STREAM_REQUEST_ERROR))
+        self.watcher.tick(NOW + 60)
+        self.assertEqual(len(self.review_sends), 1)
+        self.assertEqual(self.rpc.sends, [])
+
+    def test_herdr_screen_accepts_stream_error_only_with_empty_input(self):
+        fallback = whipper.HerdrFallback([TID], "herdr")
+        with patch.object(fallback, "run", return_value=f"■ {whipper.STREAM_REQUEST_ERROR}\n› \n"):
+            self.assertEqual(fallback.screen({}, "pane"), "ready")
+        with patch.object(fallback, "run", return_value=f"■ {whipper.STREAM_REQUEST_ERROR}\n› typed text\n"):
+            self.assertEqual(fallback.screen({}, "pane"), "herdr_input_not_empty")
 
     def test_review_newer_parent_turn_skips(self):
         self.setup_review()

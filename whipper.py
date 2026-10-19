@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retry capacity-failed Codex turns through an existing local app-server."""
+"""Retry capacity and request-stream failures through an existing local app-server."""
 from __future__ import annotations
 
 import argparse
@@ -20,10 +20,20 @@ import uuid
 from env_config import (ROOT, boolean_setting, get_setting, list_setting, local_path, read_env)
 
 CAPACITY = "Selected model is at capacity. Please try a different model"
+STREAM_REQUEST_ERROR = "stream disconnected before completion: error sending request"
+RETRYABLE_ERRORS = (("capacity", CAPACITY), ("stream_request", STREAM_REQUEST_ERROR))
 TURN_ID = re.compile(r"\bturn\.id=([0-9a-f-]{36})\b")
 PROCESS_PID = re.compile(r"^pid:(\d+):")
 LOG = logging.getLogger("codex-whipper")
 LOG_TOTAL_BYTES = 1_000_000
+
+
+def retryable_error(message):
+    """Recognize supported terminal errors, without accepting unrelated failures."""
+    for kind, prefix in RETRYABLE_ERRORS:
+        if re.match(re.escape(prefix) + r"(?:$|[\s.:;(])", message):
+            return kind
+    return None
 
 
 class BoundedLogHandler(RotatingFileHandler):
@@ -190,15 +200,16 @@ class LogStore:
         rows = self.db.execute(
             "SELECT id, ts, thread_id, process_uuid, feedback_log_body FROM logs "
             "WHERE id > ? AND id <= ? AND target = 'codex_core::session::turn' "
-            "AND instr(feedback_log_body, ?) > 0 ORDER BY id",
-            (cursor, upper, "Turn error: " + CAPACITY),
+            "AND (instr(feedback_log_body, ?) > 0 OR instr(feedback_log_body, ?) > 0) ORDER BY id",
+            (cursor, upper, "Turn error: " + CAPACITY, "Turn error: " + STREAM_REQUEST_ERROR),
         ).fetchall()
         events = []
         for log_id, ts, thread_id, process_uuid, body in rows:
             match = TURN_ID.search(body)
-            if thread_id and process_uuid and match:
+            kind = retryable_error(body.rsplit("Turn error: ", 1)[-1])
+            if thread_id and process_uuid and match and kind:
                 events.append({"log_id": log_id, "ts": ts, "thread_id": thread_id,
-                               "process_uuid": process_uuid, "turn_id": match.group(1)})
+                               "process_uuid": process_uuid, "turn_id": match.group(1), "error_kind": kind})
         return upper, events
 
 
@@ -300,7 +311,7 @@ class HerdrFallback:
         prompts = [line.strip()[1:].strip() for line in text.splitlines() if line.strip().startswith("›")]
         if not prompts or prompts[-1] not in {"", "Ask Codex to do anything"}:
             return "herdr_input_not_empty"
-        return "ready" if CAPACITY in text else "capacity_not_on_screen"
+        return "ready" if any(prefix in text for _, prefix in RETRYABLE_ERRORS) else "retryable_error_not_on_screen"
 
     def inspect(self, event, rpc):
         tid = event["thread_id"]
@@ -317,8 +328,8 @@ class HerdrFallback:
         turn = self.latest(rpc, tid)
         if not turn or turn["id"] != event["turn_id"]:
             return "newer_turn_or_no_turn"
-        if turn.get("status") != "failed" or CAPACITY not in (turn.get("error") or {}).get("message", ""):
-            return "latest_turn_not_capacity_failed"
+        if turn.get("status") != "failed" or not retryable_error((turn.get("error") or {}).get("message", "")):
+            return "latest_turn_not_retryable_failed"
         if rpc.call("thread/queue/list", {"threadId": tid, "limit": 1})["data"]:
             return "user_input_queued"
         decision = self.screen(env, pane)
@@ -352,7 +363,7 @@ class Watcher:
 
     def session_cwd(self, tid):
         # The daemon's /proc/PID/cwd belongs to the server, not the session.
-        # Metadata enrichment must never prevent capacity handling.
+        # Metadata enrichment must never prevent retry handling.
         try:
             thread = self.rpc.call("thread/read", {"threadId": tid, "includeTurns": False})["thread"]
             cwd = thread.get("cwd")
@@ -430,7 +441,7 @@ class Watcher:
                 continue
             event.update(attempts=attempts, due=max(now, event["ts"] + self.delay(attempts)))
             d["pending"][tid] = event
-            LOG.info("capacity thread=%s cwd=%s turn=%s retry_in=%.0fs", tid, cwd_field(event), event["turn_id"], event["due"] - now)
+            LOG.info("%s thread=%s cwd=%s turn=%s retry_in=%.0fs", event.get("error_kind", "capacity"), tid, cwd_field(event), event["turn_id"], event["due"] - now)
         d["cursor"] = cursor
         self.state.save()
 
@@ -461,8 +472,8 @@ class Watcher:
         turn = turns[0]
         if turn.get("status") == "inProgress" or thread.get("status", {}).get("type") == "active":
             return "wait"
-        if turn.get("status") != "failed" or CAPACITY not in (turn.get("error") or {}).get("message", ""):
-            return "latest_turn_not_capacity_failed"
+        if turn.get("status") != "failed" or not retryable_error((turn.get("error") or {}).get("message", "")):
+            return "latest_turn_not_retryable_failed"
         queued = self.rpc.call("thread/queue/list", {"threadId": tid, "limit": 1})["data"]
         if queued:
             return "user_input_queued"
@@ -499,8 +510,8 @@ class Watcher:
         turn = turns[0]
         if turn.get("status") == "inProgress":
             return "wait"
-        if turn.get("status") != "failed" or CAPACITY not in (turn.get("error") or {}).get("message", ""):
-            return "latest_turn_not_capacity_failed"
+        if turn.get("status") != "failed" or not retryable_error((turn.get("error") or {}).get("message", "")):
+            return "latest_turn_not_retryable_failed"
         messages = [item for item in turn.get("items", []) if item.get("type") == "userMessage"]
         if len(messages) != 1:
             return "review_input_unavailable"
@@ -655,7 +666,7 @@ def parse_args(argv=None):
     parser.add_argument("--message", default=value("MESSAGE", "keep doing"))
     parser.add_argument("--delay", type=float, default=numeric_defaults["DELAY"], help="Initial retry delay in seconds")
     parser.add_argument("--max-delay", type=float, default=numeric_defaults["MAX_DELAY"])
-    parser.add_argument("--max-retries", type=int, default=numeric_defaults["MAX_RETRIES"], help="Max retries per capacity failure chain")
+    parser.add_argument("--max-retries", type=int, default=numeric_defaults["MAX_RETRIES"], help="Max retries per supported failure chain")
     parser.add_argument("--max-age", type=float, default=numeric_defaults["MAX_AGE"], help="Discard failures older than this many seconds")
     parser.add_argument("--poll", type=float, default=numeric_defaults["POLL"])
     parser.add_argument("--lookback", type=float, default=numeric_defaults["LOOKBACK"], help="Seconds of history to inspect with a NEW state file")

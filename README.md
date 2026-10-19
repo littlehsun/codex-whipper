@@ -2,9 +2,9 @@
 
 [English](README.en.md) · 繁體中文
 
-監控本機 Codex session 的模型容量錯誤，自動送出 `keep doing`，讓中斷的工作繼續。
+監控本機 Codex session 的模型容量與指定的串流請求斷線錯誤，自動送出 `keep doing`，讓中斷的工作繼續。
 
-只處理實際的 `Selected model is at capacity. Please try a different model` turn failure。它會再次確認 session 狀態、避免重送，並保留最多 1 MB 的應用 log。沒有自動換模型或替你回答 approval 的功能。
+只處理實際的 `Selected model is at capacity. Please try a different model` 或 `stream disconnected before completion: error sending request` turn failure。Codex 仍在內部重新連線時不會介入；必須出現正式 `Turn error`，且最新 turn 已失敗才會續跑。它會再次確認 session 狀態、避免重送，並保留最多 1 MB 的應用 log。沒有自動換模型或替你回答 approval 的功能。
 
 ## 系統需求
 
@@ -68,7 +68,7 @@ chmod 600 .env
 | `WHIPPER_MESSAGE` | 重試訊息；預設 `keep doing`。 |
 | `WHIPPER_DELAY` | 第一次重試等待秒數；預設 `60`。 |
 | `WHIPPER_MAX_DELAY` | 最大等待秒數；預設 `300`，不得小於初始 delay。 |
-| `WHIPPER_MAX_RETRIES` | 同一條連續 capacity failure chain 的最大重試數；預設 `5`。 |
+| `WHIPPER_MAX_RETRIES` | 同一條連續支援錯誤的重試鏈 的最大重試數；預設 `5`。 |
 | `WHIPPER_MAX_AGE` | 錯誤保留秒數；預設 `1800`。 |
 | `WHIPPER_POLL` | 掃描間隔秒數；預設 `5`。 |
 | `WHIPPER_LOOKBACK` | 新 state 要補掃的歷史秒數；程式預設 `0`，範例為 `1800`。 |
@@ -87,7 +87,7 @@ Boolean 接受 `true/false`，亦接受 `1/0`、`yes/no`、`on/off`。CLI 可用
 
 ## Session 範圍與 Herdr
 
-Shared app-server 預設處理目前載入、接受直接輸入的主 session。設定 `WHIPPER_SUBAGENTS=true` 可納入同一 server 的一般子 session，仍要求已載入、接受直接輸入、最新 turn 為 capacity failure 且沒有排隊輸入。內部／ephemeral session、不同 app-server process、已有新 turn 或其他錯誤會跳過；active session 不會故意被 steer。
+Shared app-server 預設處理目前載入、接受直接輸入的主 session。設定 `WHIPPER_SUBAGENTS=true` 可納入同一 server 的一般子 session，仍要求已載入、接受直接輸入、最新 turn 為上述支援的 failure 且沒有排隊輸入。內部／ephemeral session、不同 app-server process、已有新 turn 或其他錯誤會跳過；active session 不會故意被 steer。
 
 Review 子 session 可在卸載後恢復：從本機 rollout 核對子／主 session 與原始主 turn，讀取失敗 reviewer 的原始文字輸入，以 `review/start` 的 `custom` target 在主 session 重新審查。這會重跑審查，不會從中斷點接續；未保留原始 target 類型，因此只在能取回完整文字要求時重送。主 session 必須閒置、原 review 仍為最新失敗／中斷 turn，子／主 session 都不得有排隊輸入；已重新 review、已有新 turn 或找不到完整來源時會跳過。Review 重試計數依主 session 保存，沿用相同退避、次數上限與不確定送出防護。Herdr 仍只處理明確允許的主 session。
 
@@ -99,7 +99,7 @@ Herdr 可透過明確的 pane ID 查看 session（在你自己的 Herdr 環境�
 herdr agent get <pane-id>
 ```
 
-使用回傳的 `agent.agent_session.value` 作為 UUID。Script 從原 process 讀取 pane/socket，核對 foreground PID、session UUID、idle/done、主 session 範圍、最新 capacity failure、沒有 queued input 及空白輸入框。blocked、unknown、有未送出文字或 session 已替換時不送出；不切換焦點、不重啟 CLI、不回答 approval。
+使用回傳的 `agent.agent_session.value` 作為 UUID。Script 從原 process 讀取 pane/socket，核對 foreground PID、session UUID、idle/done、主 session 範圍、最新支援的 failure、沒有 queued input 及空白輸入框。blocked、unknown、有未送出文字或 session 已替換時不送出；不切換焦點、不重啟 CLI、不回答 approval。
 
 Herdr 的 `agent prompt` 回報送出後，還必須讀到新 turn ID 才算 accepted。其他獨立 app-server 及遠端主機不會自動套用本機 fallback。
 
@@ -107,10 +107,10 @@ Herdr 的 `agent prompt` 回報送出後，還必須讀到新 turn ID 才算 acc
 
 1. 唯讀掃描 Codex SQLite log 的新增紀錄。只接受 `codex_core::session::turn` 的實際 `Turn error`，不把聊天中的錯誤字串當成 failure。
 2. 擷取 process/thread/turn ID，確認控制介面及最新 turn 仍相符。
-3. 確認最新 turn 是 capacity failure、session 為 idle 或該 failure 留下的 systemError、沒有 queued user input。
+3. 確認最新 turn 是上述支援的 failure、session 為 idle 或該 failure 留下的 systemError、沒有 queued user input。
 4. 保存該事件已消耗，再送出訊息，讀回新 turn ID。
 
-預設間隔為 **60、120、240、300、300 秒**，最多 5 次。只有自己啟動的下一輪又出現 capacity failure 才延續重試計數；新的使用者 turn 另算。成功送出不代表模型一定可用，容量仍滿時會再進入此流程。
+預設間隔為 **60、120、240、300、300 秒**，最多 5 次。只有自己啟動的下一輪又出現支援的 failure 才延續重試計數；新的使用者 turn 另算。成功送出不代表模型一定可用，容量仍滿時會再進入此流程。
 
 State 用 atomic rename、fsync 和檔案鎖保存 cursor、待處理事件與重試鏈。請勿用不同 state 同時啟動多個正式 watcher 監控同一 session。
 
@@ -126,7 +126,7 @@ Dry-run 不使用 live state：預設是 `dry-run.json`；如果在 `.env` 或 C
 tail -F logs/whipper.log
 ```
 
-`capacity` 是偵測到錯誤、`sent` 是已送出且有新 turn、`skip` 帶跳過原因。以下為格式示例：
+`capacity`／`stream_request` 分別是偵測到容量／串流請求錯誤、`sent` 是已送出且有新 turn、`skip` 帶跳過原因。以下為格式示例：
 
 ```text
 INFO capacity thread=<session-uuid> cwd="/work/project" turn=<turn-uuid> retry_in=60s

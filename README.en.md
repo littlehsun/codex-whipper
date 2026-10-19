@@ -2,9 +2,9 @@
 
 English · [繁體中文](README.md)
 
-Watch local Codex sessions for model-capacity failures and submit `keep doing` so interrupted work can continue.
+Watch local Codex sessions for model-capacity and specific request-stream failures and submit `keep doing` so interrupted work can continue.
 
-The watcher only handles actual turns that fail with `Selected model is at capacity. Please try a different model`. It checks session state again before submitting, avoids replaying consumed failures, and keeps application logs within a 1 MB budget. It does not change models or answer approval dialogs.
+The watcher only handles actual turns that fail with `Selected model is at capacity. Please try a different model` or `stream disconnected before completion: error sending request`. It leaves Codex’s internal reconnection attempts alone: a terminal `Turn error` and a latest failed turn are required. It checks session state again before submitting, avoids replaying consumed failures, and keeps application logs within a 1 MB budget. It does not change models or answer approval dialogs.
 
 ## Requirements
 
@@ -68,7 +68,7 @@ Precedence: **CLI options > process environment > `.env` > built-in defaults**.
 | `WHIPPER_MESSAGE` | Retry prompt; default `keep doing`. |
 | `WHIPPER_DELAY` | Initial delay in seconds; default `60`. |
 | `WHIPPER_MAX_DELAY` | Maximum delay; default `300`, at least the initial delay. |
-| `WHIPPER_MAX_RETRIES` | Maximum retries per continuous capacity failure chain; default `5`. |
+| `WHIPPER_MAX_RETRIES` | Maximum retries per continuous supported-error retry chain; default `5`. |
 | `WHIPPER_MAX_AGE` | Failure lifetime in seconds; default `1800`. |
 | `WHIPPER_POLL` | Scan interval in seconds; default `5`. |
 | `WHIPPER_LOOKBACK` | Historical window for new state; built-in `0`, example `1800`. |
@@ -87,7 +87,7 @@ Booleans accept `true/false`, `1/0`, `yes/no`, or `on/off`. Override enabled fil
 
 ## Session scope and Herdr
 
-The shared-server path handles loaded root sessions that accept direct input. Set `WHIPPER_SUBAGENTS=true` to include ordinary children on the same server, still requiring a loaded thread, direct-input capability, a latest capacity-failed turn, and no queued input. Internal/ephemeral sessions, another server process, changed turns, and other errors are skipped. It does not intentionally steer an active session.
+The shared-server path handles loaded root sessions that accept direct input. Set `WHIPPER_SUBAGENTS=true` to include ordinary children on the same server, still requiring a loaded thread, direct-input capability, a latest turn failed with a supported error, and no queued input. Internal/ephemeral sessions, another server process, changed turns, and other errors are skipped. It does not intentionally steer an active session.
 
 Review children can recover after unloading: verify the child, parent, and original parent turn against the local rollout, then replay the failed reviewer’s original text input using `review/start` with a `custom` target on the parent. This reruns the review rather than resuming its interrupted execution. The original target type is not retained; only complete text requests qualify. The parent must be idle with the original failed/interrupted review still current, and neither thread may have queued input. Newer reviews/turns or missing origin/input cause a skip. Review retry chains are stored under the parent and retain the same backoff, limits, and uncertain-dispatch protections. Herdr remains restricted to explicitly allowed root sessions.
 
@@ -99,7 +99,7 @@ In your own Herdr environment, inspect an explicit pane:
 herdr agent get <pane-id>
 ```
 
-Use the returned `agent.agent_session.value` as the UUID. The watcher obtains the pane/socket from the original process, then checks the foreground PID, Codex session UUID, idle/done state, root-session scope, latest capacity failure, absence of queued input, and empty composer. Blocked, unknown, replaced sessions, or pending typed input are not prompted. It does not change focus, restart the CLI, or answer approval dialogs.
+Use the returned `agent.agent_session.value` as the UUID. The watcher obtains the pane/socket from the original process, then checks the foreground PID, Codex session UUID, idle/done state, root-session scope, latest supported failure, absence of queued input, and empty composer. Blocked, unknown, replaced sessions, or pending typed input are not prompted. It does not change focus, restart the CLI, or answer approval dialogs.
 
 A successful `agent prompt` submission is not sufficient: a new turn ID must be observed before the retry is recorded as accepted. Other standalone app-servers and remote hosts are not automatically controlled through this local fallback.
 
@@ -107,10 +107,10 @@ A successful `agent prompt` submission is not sufficient: a new turn ID must be 
 
 1. Read new Codex SQLite records without modifying the database. Only `codex_core::session::turn` records containing an actual `Turn error` qualify; mentioning the error in a conversation does not.
 2. Extract process/thread/turn IDs and verify the control endpoint and latest turn.
-3. Confirm the latest turn still failed for capacity, the session is idle or in the resulting systemError state, and no user input is queued.
+3. Confirm the latest turn still failed with a supported error, the session is idle or in the resulting systemError state, and no user input is queued.
 4. Persist consumption before submitting, then read back the new turn ID.
 
-Default delays are **60, 120, 240, 300, and 300 seconds**, at most five retries. Only a capacity failure of the watcher's own next turn continues the retry count. A new user turn starts a separate chain. Submission does not guarantee capacity is available; another capacity failure returns to this flow.
+Default delays are **60, 120, 240, 300, and 300 seconds**, at most five retries. Only a supported failure of the watcher's own next turn continues the retry count. A new user turn starts a separate chain. Submission does not guarantee capacity is available; another capacity failure returns to this flow.
 
 State stores the cursor, pending events, and retry chains using atomic rename, fsync, and a file lock. Do not run multiple live watchers with different state files against the same session.
 
@@ -126,7 +126,7 @@ A timeout, disconnect, or rejected dispatch marks the thread `uncertain_or_rejec
 tail -F logs/whipper.log
 ```
 
-`capacity` means a detected failure, `sent` means submitted with a new turn observed, and `skip` includes the reason. Example format:
+`capacity` / `stream_request` identify detected capacity / request-stream failures, `sent` means submitted with a new turn observed, and `skip` includes the reason. Example format:
 
 ```text
 INFO capacity thread=<session-uuid> cwd="/work/project" turn=<turn-uuid> retry_in=60s
